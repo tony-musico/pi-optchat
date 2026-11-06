@@ -20,6 +20,11 @@ import { registerReportRenderer, type ReportDetails } from './report-message.ts'
 import { memoryTools } from './tools.ts';
 import { result, searchTool } from './core/tools.ts';
 import { Children, loadedBuiltins, modelsTool, refreshContextFiles, TASKS } from './agents.ts';
+import { createStatusPublisher, statusBus, type StatusPublisher } from './agent-status.ts';
+import { EVENTS_CONTENT_FLAG, EVENTS_CONTROL_FLAG } from './events-contract.ts';
+import { createOwnerEvents, type OwnerEvents } from './owner-events.ts';
+import { createOutputEvents, type OutputEvents } from './output-events.ts';
+import { createEventControls, type ControlThinking, type EventControls } from './events-controls.ts';
 import { isActiveRun, type RunInfo } from './runs.ts';
 import { exportBrowser } from './browser.ts';
 import { Inbox } from './inbox.ts';
@@ -70,6 +75,15 @@ export default function optchat(pi: ExtensionAPI) {
   let joined: Awaited<ReturnType<typeof joinHeadless>> | undefined;
   let closeWindows: (() => Promise<void>) | undefined;
   let recovery: Promise<void> | undefined;
+  /** The live status other extensions in this process may read. One publisher per profile owner. */
+  let statusPublisher: StatusPublisher | undefined;
+  /** Owner-scoped metadata and request listeners. One coordinator per owner lifetime. */
+  let ownerEvents: OwnerEvents | undefined;
+  /** Opt-in assistant-output projection and subscriptions. */
+  let outputEvents: OutputEvents | undefined;
+  /** Opt-in, policy-checked background-agent controls. */
+  let eventControls: EventControls | undefined;
+  let ownerGeneration = 0;
   let run: AgentMessage[] = [];
   let previous: AgentMessage[] = [];
   let logged = 0;
@@ -109,6 +123,8 @@ export default function optchat(pi: ExtensionAPI) {
   pi.registerFlag('optchat-profile', { description: 'OptChat profile (required for noninteractive sessions without a saved binding)', type: 'string' });
   pi.registerFlag('optchat-connect', { description: 'pi -p on a profile open in another Pi: auto (join it if busy, default), join (only join), off (error if busy)', type: 'string', default: 'auto' });
   pi.registerFlag('optchat-agent', { description: 'Open an existing background agent by exact ID in this terminal (TUI only; requires a running profile owner)', type: 'string' });
+  pi.registerFlag(EVENTS_CONTENT_FLAG, { description: 'Allow trusted in-process extensions to request bounded OptChat assistant content and history', type: 'boolean', default: false });
+  pi.registerFlag(EVENTS_CONTROL_FLAG, { description: 'Allow trusted in-process extensions to request authorized OptChat background-agent controls', type: 'boolean', default: false });
   const connectMode = () => {
     const mode = pi.getFlag('optchat-connect') ?? 'auto';
     const known = CONNECT_MODES.find(m => m === mode);
@@ -201,6 +217,11 @@ export default function optchat(pi: ExtensionAPI) {
     saveReports();
   };
   const stop = async () => {
+    // The old owner announces closing with its identity before its listeners and status stop.
+    eventControls?.dispose(); eventControls = undefined;
+    ownerEvents?.dispose(); ownerEvents = undefined;
+    outputEvents?.dispose(); outputEvents = undefined;
+    statusPublisher?.dispose(); statusPublisher = undefined;
     remote?.close(); remote = undefined; joined?.close(); joined = undefined;
     inspectorController?.abort(); unmountNavigation?.(); unmountNavigation = undefined;
     stopping = true; importController?.abort(); await importTask?.catch(() => {});
@@ -256,9 +277,13 @@ export default function optchat(pi: ExtensionAPI) {
     // Pi's RPC mode binds extensions twice after new_session/switch_session/fork/clone (setRebindSession, then rebindSession()),
     // so session_start can arrive again for the session this profile already serves. Taking the lock again would meet our own socket.
     // Only the same session is kept: another session without a session_shutdown still fails loudly below.
-    if (active?.name === name && active.session === ctx.sessionManager.getSessionId()) { await restoreMain(ctx, active); status(ctx); return; }
+    if (active?.name === name && active.session === ctx.sessionManager.getSessionId()) { await restoreMain(ctx, active); ownerEvents?.replay(); statusPublisher?.replay(); status(ctx); return; }
     const unlock = await holdProfile(storeFor(dir), dir, name, `${name} · PID ${process.pid} · ${hostname()} · ${ctx.cwd}`, warning => ctx.ui.notify(warning, 'warning'));
     let openingMemory: Memory | undefined;
+    let publisher: StatusPublisher | undefined;
+    let owner: OwnerEvents | undefined;
+    let output: OutputEvents | undefined;
+    let controls: EventControls | undefined;
     try {
       const config = loadConfig(dir);
       const sessionId = ctx.sessionManager.getSessionId();
@@ -290,6 +315,53 @@ export default function optchat(pi: ExtensionAPI) {
       // A one-shot run (`pi -p`, JSON) exits after its own prompt, which would end every conversation connected to it.
       if (ctx.mode !== 'print' && ctx.mode !== 'json') closeWindows = await serveWindows(dir, children, () => !stopping && !importing && !pendingImport(dir), deliverReport);
       untitle = children.subscribe(() => showTitle(ctx)); showTitle(ctx);
+      // The live status starts with the profile, before any recovery runs, so a host never sees a half-open profile.
+      const bus = statusBus(pi.events);
+      if (bus) {
+        eventControls?.dispose(); eventControls = undefined;
+        ownerEvents?.dispose(); ownerEvents = undefined;
+        statusPublisher?.dispose(); statusPublisher = undefined; // one publisher per owner: the old one goes first.
+        outputEvents?.dispose(); outputEvents = undefined;
+        // Owner request listeners exist before the first capability advertisement.
+        owner = createOwnerEvents({
+          bus,
+          ownerSessionId: sessionId,
+          generation: ++ownerGeneration,
+          contentEnabled: pi.getFlag(EVENTS_CONTENT_FLAG) === true,
+          controlEnabled: pi.getFlag(EVENTS_CONTROL_FLAG) === true,
+        });
+        ownerEvents = owner;
+        output = createOutputEvents({
+          bus,
+          ownerSessionId: sessionId,
+          ownerEpoch: owner.ownerEpoch,
+          contentEnabled: pi.getFlag(EVENTS_CONTENT_FLAG) === true,
+          turnId: () => ownerEvents?.currentTurnId() ?? null,
+        });
+        outputEvents = output;
+        controls = createEventControls({
+          bus,
+          ownerSessionId: sessionId,
+          ownerEpoch: owner.ownerEpoch,
+          contentEnabled: pi.getFlag(EVENTS_CONTENT_FLAG) === true,
+          controlEnabled: pi.getFlag(EVENTS_CONTROL_FLAG) === true,
+          children,
+          cwd: ctx.cwd,
+          branch: () => ctx.sessionManager.getBranch(),
+          models: () => ctx.modelRegistry.getAvailable()
+            .filter(model => ctx.modelRegistry.hasConfiguredAuth(model))
+            .map(model => ({ name: `${model.provider}/${model.id}`, thinking: getSupportedThinkingLevels(model) as ControlThinking[] })),
+          maxAgents: config.maxAgents,
+          subagentLevels: config.subagentLevels,
+        });
+        eventControls = controls;
+        publisher = createStatusPublisher({ bus, profile: name, ownerSessionId: sessionId,
+          integrations: owner.capabilities,
+          source: { list: () => children.history.list(), live: id => { const live = children.live(id); return live ? { updated: live.updated, tools: live.tools } : undefined; } },
+          subscribe: listener => children.subscribe(listener), warn: text => ctx.ui.notify(text, 'warning') });
+        statusPublisher = publisher;
+        owner.ready();
+      }
       status(ctx);
       ctx.ui.notify(`${brand} · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
       const queuedReports = [...reports];
@@ -300,6 +372,12 @@ export default function optchat(pi: ExtensionAPI) {
       }
       setImmediate(() => { if (active?.memory === memory && !pendingImport(dir)) for (const r of queuedReports) sendReport(r); });
     } catch (error) {
+      controls?.dispose(); if (eventControls === controls) eventControls = undefined;
+      // If readiness was already published, close that exact owner identity
+      // before removing its listeners instead of leaving a false advertisement.
+      owner?.dispose(true); if (ownerEvents === owner) ownerEvents = undefined;
+      output?.dispose(); if (outputEvents === output) outputEvents = undefined;
+      publisher?.dispose(); if (statusPublisher === publisher) statusPublisher = undefined;
       await closeWindows?.(); closeWindows = undefined;
       untitle?.(); untitle = undefined; title.clear();
       if (active && active.memory === openingMemory) {
@@ -407,6 +485,7 @@ export default function optchat(pi: ExtensionAPI) {
   pi.on('session_before_switch', (event, ctx) => blockSwitch(event.reason === 'new' ? '/new' : '/resume', ctx));
   pi.on('session_before_fork', (event, ctx) => blockSwitch(event.position === 'at' ? '/clone' : '/fork', ctx));
   pi.on('input', async (event, ctx) => {
+    ownerEvents?.setPending(ctx.hasPendingMessages());
     if (joined) {
       try {
         if (event.images?.length) throw new Error('Joining a running profile accepts text only; provide a file path for the agent to read.');
@@ -433,9 +512,20 @@ export default function optchat(pi: ExtensionAPI) {
     }
     return { action: 'continue' };
   });
-  pi.on('agent_start', (_event, ctx) => { working = true; showTitle(ctx); });
+  pi.on('agent_start', (_event, ctx) => { ownerEvents?.beginActivity(); ownerEvents?.setPending(ctx.hasPendingMessages()); working = true; showTitle(ctx); });
+  pi.on('message_start', event => outputEvents?.messageStart(event.message));
+  pi.on('message_update', (event, _ctx) => {
+    outputEvents?.messageUpdate(event.assistantMessageEvent);
+    if (event.assistantMessageEvent.type === 'text_delta') ownerEvents?.observeAssistantText();
+  });
+  pi.on('tool_execution_start', event => ownerEvents?.toolStarted(event.toolCallId, event.toolName));
+  pi.on('tool_execution_end', event => ownerEvents?.toolEnded(event.toolCallId));
+  pi.on('ui_prompt_start', () => ownerEvents?.attentionStarted());
+  pi.on('ui_prompt_end', () => ownerEvents?.attentionEnded());
   // Every run starts here, reports sent while Pi is idle too (Pi 1.2+).
   pi.on('before_agent_start', (event, ctx) => {
+    ownerEvents?.setPending(ctx.hasPendingMessages());
+    ownerEvents?.beginActivity();
     if (!active) return; // Plain Pi run: leave Pi's own prompt untouched.
     const a = active;
     flush(); run = []; logged = 0; keep = 0; view = undefined; runStarted = true; wake = event.messageType === 'custom';
@@ -450,6 +540,7 @@ export default function optchat(pi: ExtensionAPI) {
   });
   const DUPLICATE_REPORT = '(duplicate report, already delivered)';
   pi.on('message_end', async (event, ctx) => {
+    outputEvents?.messageEnd(event.message);
     if (!active || !runStarted) return;
     const bounded = boundedMessage(event.message);
     // Pi puts the message that starts a run first, before any context it or other extensions inject.
@@ -540,7 +631,10 @@ export default function optchat(pi: ExtensionAPI) {
     catch (error) { ctx.ui.notify(`Could not save usage: ${errorText(error)}`, 'error'); }
   };
   pi.on('turn_end', (_event, ctx) => collectUsage(ctx));
-  pi.on('agent_settled', async (_event, ctx) => {
+  pi.on('agent_settled', async (event, ctx) => {
+    outputEvents?.settled(event.aborted);
+    ownerEvents?.settle();
+    ownerEvents?.setPending(ctx.hasPendingMessages());
     collectUsage(ctx);
     try { flush(); active?.inbox.dropReturned(); } catch (error) { fault = errorText(error); ctx.ui.notify(fault, 'error'); }
     // A report steered into this run that never reached it (Esc or a dequeue cleared Pi's queue) is sent again, now as its own turn.

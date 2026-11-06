@@ -191,6 +191,19 @@ This opens that same agent's session; what you type is guidance to it. Closing t
 
 Details (reload behaviour, handoff limits, attach rules, headless joins): [docs/connected-windows.md](docs/connected-windows.md).
 
+## Live agent status for extensions
+
+The Pi process that owns a profile publishes what its background agents are doing on Pi's in-process event bus: state, model, elapsed time, current tool, last activity, and how many agents are running, paused or still owing a handoff. Another extension in the same process can show that without importing OptChat or reading its files.
+
+- **In-process only**: another terminal, a `pi -p` run and a connected window see nothing. Only the process that opened the profile publishes.
+- **Observation only**: nothing in this background-agent snapshot contract can start, steer or stop an agent. Separate event integrations have their own consent flags.
+- **Private by default**: no task text, no titles, no paths, no transcripts, no tool arguments or output.
+- **Bounded**: 64 agents per snapshot, at most one snapshot every 250 ms, and the counts stay exact past the cap.
+
+Contract, channels and a host example: [docs/agent-status.md](docs/agent-status.md).
+
+A separate, capability-gated event contract provides main-agent status, opt-in assistant output, authorized background-agent controls, and bounded history/result reads. It is disabled by default and requires the independent `--optchat-events-content` and/or `--optchat-events-control` CLI flags. See the [Pi events integration guide](docs/events-integration.md) for the exact channels, envelopes, limits, unsupported operations, and Discord bridge boundary. OptChat does not ship a Discord transport or remote conversation/approval API.
+
 ## Storage
 
 Profile data lives in `~/.optchat/profiles/<name>/` (override the root with `OPTCHAT_HOME`):

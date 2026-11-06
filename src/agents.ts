@@ -546,10 +546,13 @@ export class Children {
     if (batch && batch.ids.length > 1) this.options.hold?.(batch.ids[0], []);
   }
   /** `caller` is the agent sending a manager message: undefined for the main agent, else the parent subagent's ID. */
-  async tell(id: string, message: string, source: 'manager' | 'user' = 'manager', caller?: string) {
+  async tell(id: string, message: string, source: 'manager' | 'user' = 'manager', caller?: string, options: { allowResume?: boolean } = {}) {
     if (this.deleting.has(id)) throw new Error(`${id} is being deleted by the user.`);
     const live = this.running.get(id);
-    if (!live && source === 'manager' && this.history.records.has(id)) return this.track(this.resume(id, message, caller));
+    if (!live && source === 'manager' && this.history.records.has(id)) {
+      if (options.allowResume === false) throw new Error(`${id} is not running.`);
+      return this.track(this.resume(id, message, caller));
+    }
     if (live && !['running', 'waiting', 'paused'].includes(live.info.state)) throw new Error(`${id} is finishing. Its report will arrive on its own${live.info.connected || source === 'user' ? '' : '; tell it again after that to resume it'}.`);
     if (!live) throw new Error(`No running subagent ${id}.`);
     const text = live.info.connected && source === 'manager' ? `[Main agent guidance]\n${message.trim()}` : message.trim(); if (!message.trim()) throw new Error('Message is empty.');
