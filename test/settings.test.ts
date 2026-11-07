@@ -201,6 +201,29 @@ test('the previous exchange can be turned off, and its size limit is the profile
   }
 });
 
+test('the events gates round-trip, and a gate that is not a boolean is refused', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-events-settings-'));
+  try {
+    const changed = { ...defaults, eventsContent: true, eventsControl: true };
+    saveConfig(dir, changed);
+    assert.equal(loadConfig(dir).eventsContent, true);
+    assert.equal(loadConfig(dir).eventsControl, true);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ ...changed, eventsContent: 'yes' }));
+    assert.throws(() => loadConfig(dir), /Invalid profile config/);
+  } finally { removeDir(dir); }
+});
+
+test('the settings page shows the events gates, off by default', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-page-'));
+  try {
+    const config: ProfileConfig = { ...defaults };
+    const page = settingsPage(plain, { profile: 'demo', config, models: [{ name: 'anthropic/claude-sonnet-5-5', thinking: ['low', 'medium'] }], save: next => saveConfig(dir, next) }, () => {});
+    const rendered = page.render(100).join('\n');
+    assert.match(rendered, /Events content\s+off\s+default/);
+    assert.match(rendered, /Events control\s+off\s+default/);
+  } finally { removeDir(dir); }
+});
+
 test('the settings page saves a valid number and explains an invalid one', () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-page-'));
   try {

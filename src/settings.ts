@@ -30,6 +30,12 @@ export const SETTINGS = {
   refreshAt: { kind: 'percent', label: 'Turn refresh threshold', default: 0.3, min: 0, max: 0.9,
     description: 'When a turn fills this share of the context window, it moves into memory and continues in a fresh window. 0%: off (Victor\'s recipe). OPTCHAT_REFRESH_AT overrides it.',
     applies: 'Applies from the next call and to new or resumed subagents.' },
+  eventsContent: { kind: 'toggle', label: 'Events content', default: false,
+    description: 'Lets trusted extensions in this Pi process read bounded assistant output and history over pi.events. Off: those requests are refused.',
+    applies: 'Applies at once; the events integration is rebuilt, so a subscriber binds to the new owner again.' },
+  eventsControl: { kind: 'toggle', label: 'Events control', default: false,
+    description: 'Lets trusted extensions in this Pi process spawn, steer, stop and resume background agents over pi.events. Off: those requests are refused.',
+    applies: 'Applies at once; the events integration is rebuilt, so a subscriber binds to the new owner again.' },
 } as const;
 
 export type SettingKey = keyof typeof SETTINGS;

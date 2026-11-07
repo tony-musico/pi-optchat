@@ -100,6 +100,8 @@ Compression and subagents make extra model requests with your provider credentia
 | Summary size tolerance | 640 bytes | The compactor is always asked for 512-byte lines; a longer line up to this size is kept instead of retried. 512 is the recipe's strict rule. |
 | Turn refresh threshold | 30% | Once the current turn's verbatim messages pass this share of the model's context window, they move into memory and the turn goes on with a fresh window (see [Good to know](#good-to-know)). Type 30, 30% or 0.3. 0% is off, as in the recipe. Applies from the next call. |
 | Summaries at once | 8 | Summaries built at once, by chat compaction and by an import, 1 to 64. With N at once, a summary can see up to N−1 lines not summarized yet before it, so higher is faster but a little less accurate (at 8 that costs about 0.8 points per summary, #108). Higher also hits your provider's rate limits harder (the compactor retries what is refused), so if your provider caps parallel requests, set it below that cap so the main turn has room. Applies to the next import, and to chat once the profile opens again. A `config.json` that still says `importJobs` keeps its value. |
+| Events content | off | Lets trusted extensions in this Pi process read bounded assistant output and history over `pi.events`. Off: those requests are refused. The `--optchat-events-content` flag turns this gate on for one run. Applies at once; the events integration is rebuilt, so a subscriber binds to the new owner again. |
+| Events control | off | Lets trusted extensions in this Pi process spawn, steer, stop and resume background agents over `pi.events`. Off: those requests are refused. The `--optchat-events-control` flag turns this gate on for one run. Applies at once; the events integration is rebuilt, so a subscriber binds to the new owner again. |
 
 Numbers must be whole numbers of at least 1 (512 for the summary size tolerance, at most 64 for Summaries at once); Turn refresh threshold is a percentage from 0% to 90%. Missing keys in an older `config.json` take their defaults.
 
@@ -202,7 +204,7 @@ The Pi process that owns a profile publishes what its background agents are doin
 
 Contract, channels and a host example: [docs/agent-status.md](docs/agent-status.md).
 
-A separate, capability-gated event contract provides main-agent status, opt-in assistant output, authorized background-agent controls, and bounded history/result reads. It is disabled by default and requires the independent `--optchat-events-content` and/or `--optchat-events-control` CLI flags. See the [Pi events integration guide](docs/events-integration.md) for the exact channels, envelopes, limits, unsupported operations, and Discord bridge boundary. OptChat does not ship a Discord transport or remote conversation/approval API.
+A separate, capability-gated event contract provides main-agent status, opt-in assistant output, authorized background-agent controls, and bounded history/result reads. It is disabled by default: each gate is turned on by its `--optchat-events-content` / `--optchat-events-control` CLI flag, or per profile in `/optchat settings` (Events content, Events control). See the [Pi events integration guide](docs/events-integration.md) for the exact channels, envelopes, limits, unsupported operations, and Discord bridge boundary. OptChat does not ship a Discord transport or remote conversation/approval API.
 
 ## Storage
 

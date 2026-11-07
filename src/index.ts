@@ -271,6 +271,71 @@ export default function optchat(pi: ExtensionAPI) {
     }
     return names.length === 1 ? names[0] : undefined;
   };
+  /** The events consent gates for a profile: its own settings, or the CLI flag that turns one on for this run. */
+  const eventsGates = (config: ProfileConfig) => ({
+    content: pi.getFlag(EVENTS_CONTENT_FLAG) === true || config.eventsContent,
+    control: pi.getFlag(EVENTS_CONTROL_FLAG) === true || config.eventsControl,
+  });
+  /**
+   * Builds the events integration for a profile owner: the owner coordinator, the output projection, the agent
+   * controls and the status publisher. A rebuild replaces the owner, so a consumer binds to the new epoch again.
+   */
+  const wireEvents = (ctx: ExtensionContext, name: string, config: ProfileConfig, sessionId: string, children: Children) => {
+    const bus = statusBus(pi.events);
+    if (!bus) return undefined;
+    eventControls?.dispose(); eventControls = undefined;
+    ownerEvents?.dispose(); ownerEvents = undefined;
+    statusPublisher?.dispose(); statusPublisher = undefined; // one publisher per owner: the old one goes first.
+    outputEvents?.dispose(); outputEvents = undefined;
+    const gates = eventsGates(config);
+    let owner: OwnerEvents | undefined, output: OutputEvents | undefined, controls: EventControls | undefined, publisher: StatusPublisher | undefined;
+    try {
+      // Owner request listeners exist before the first capability advertisement.
+      owner = createOwnerEvents({
+        bus,
+        ownerSessionId: sessionId,
+        generation: ++ownerGeneration,
+        contentEnabled: gates.content,
+        controlEnabled: gates.control,
+      });
+      ownerEvents = owner;
+      output = createOutputEvents({
+        bus,
+        ownerSessionId: sessionId,
+        ownerEpoch: owner.ownerEpoch,
+        contentEnabled: gates.content,
+        turnId: () => ownerEvents?.currentTurnId() ?? null,
+      });
+      outputEvents = output;
+      controls = createEventControls({
+        bus,
+        ownerSessionId: sessionId,
+        ownerEpoch: owner.ownerEpoch,
+        contentEnabled: gates.content,
+        controlEnabled: gates.control,
+        children,
+        cwd: ctx.cwd,
+        branch: () => ctx.sessionManager.getBranch(),
+        models: () => ctx.modelRegistry.getAvailable()
+          .filter(model => ctx.modelRegistry.hasConfiguredAuth(model))
+          .map(model => ({ name: `${model.provider}/${model.id}`, thinking: getSupportedThinkingLevels(model) as ControlThinking[] })),
+        maxAgents: config.maxAgents,
+        subagentLevels: config.subagentLevels,
+      });
+      eventControls = controls;
+      publisher = createStatusPublisher({ bus, profile: name, ownerSessionId: sessionId,
+        integrations: owner.capabilities,
+        source: { list: () => children.history.list(), live: id => { const live = children.live(id); return live ? { updated: live.updated, tools: live.tools } : undefined; } },
+        subscribe: listener => children.subscribe(listener), warn: text => ctx.ui.notify(text, 'warning') });
+      statusPublisher = publisher;
+      owner.ready();
+    } catch (error) {
+      controls?.dispose(); owner?.dispose(true); output?.dispose(); publisher?.dispose();
+      eventControls = undefined; ownerEvents = undefined; outputEvents = undefined; statusPublisher = undefined;
+      throw error;
+    }
+    return { owner, output, controls, publisher };
+  };
   const openProfile = async (name: string, ctx: ExtensionContext) => {
     const dir = profilePath(name);
     if (!existsSync(dir)) throw new Error(`Profile ${name} does not exist. Use /optchat profile to create it.`);
@@ -316,52 +381,8 @@ export default function optchat(pi: ExtensionAPI) {
       if (ctx.mode !== 'print' && ctx.mode !== 'json') closeWindows = await serveWindows(dir, children, () => !stopping && !importing && !pendingImport(dir), deliverReport);
       untitle = children.subscribe(() => showTitle(ctx)); showTitle(ctx);
       // The live status starts with the profile, before any recovery runs, so a host never sees a half-open profile.
-      const bus = statusBus(pi.events);
-      if (bus) {
-        eventControls?.dispose(); eventControls = undefined;
-        ownerEvents?.dispose(); ownerEvents = undefined;
-        statusPublisher?.dispose(); statusPublisher = undefined; // one publisher per owner: the old one goes first.
-        outputEvents?.dispose(); outputEvents = undefined;
-        // Owner request listeners exist before the first capability advertisement.
-        owner = createOwnerEvents({
-          bus,
-          ownerSessionId: sessionId,
-          generation: ++ownerGeneration,
-          contentEnabled: pi.getFlag(EVENTS_CONTENT_FLAG) === true,
-          controlEnabled: pi.getFlag(EVENTS_CONTROL_FLAG) === true,
-        });
-        ownerEvents = owner;
-        output = createOutputEvents({
-          bus,
-          ownerSessionId: sessionId,
-          ownerEpoch: owner.ownerEpoch,
-          contentEnabled: pi.getFlag(EVENTS_CONTENT_FLAG) === true,
-          turnId: () => ownerEvents?.currentTurnId() ?? null,
-        });
-        outputEvents = output;
-        controls = createEventControls({
-          bus,
-          ownerSessionId: sessionId,
-          ownerEpoch: owner.ownerEpoch,
-          contentEnabled: pi.getFlag(EVENTS_CONTENT_FLAG) === true,
-          controlEnabled: pi.getFlag(EVENTS_CONTROL_FLAG) === true,
-          children,
-          cwd: ctx.cwd,
-          branch: () => ctx.sessionManager.getBranch(),
-          models: () => ctx.modelRegistry.getAvailable()
-            .filter(model => ctx.modelRegistry.hasConfiguredAuth(model))
-            .map(model => ({ name: `${model.provider}/${model.id}`, thinking: getSupportedThinkingLevels(model) as ControlThinking[] })),
-          maxAgents: config.maxAgents,
-          subagentLevels: config.subagentLevels,
-        });
-        eventControls = controls;
-        publisher = createStatusPublisher({ bus, profile: name, ownerSessionId: sessionId,
-          integrations: owner.capabilities,
-          source: { list: () => children.history.list(), live: id => { const live = children.live(id); return live ? { updated: live.updated, tools: live.tools } : undefined; } },
-          subscribe: listener => children.subscribe(listener), warn: text => ctx.ui.notify(text, 'warning') });
-        statusPublisher = publisher;
-        owner.ready();
-      }
+      const wired = wireEvents(ctx, name, config, sessionId, children);
+      owner = wired?.owner; output = wired?.output; controls = wired?.controls; publisher = wired?.publisher;
       status(ctx);
       ctx.ui.notify(`${brand} · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
       const queuedReports = [...reports];
@@ -675,7 +696,14 @@ export default function optchat(pi: ExtensionAPI) {
   /** The settings page's options: every model Pi is logged in to, with the thinking levels it takes, sorted so each provider's models sit together. */
   const settingsOptions = (ctx: ExtensionContext, a: Active) => ({ profile: a.name, config: a.config,
     models: ctx.modelRegistry.getAvailable().map(m => ({ name: `${m.provider}/${m.id}`, thinking: getSupportedThinkingLevels(m) })).sort((x, y) => x.name.localeCompare(y.name)),
-    save: (config: ProfileConfig) => saveConfig(a.dir, config) });
+    save: (config: ProfileConfig) => {
+      saveConfig(a.dir, config);
+      // The events gates are fixed when the integration is built, so a changed gate rebuilds it in this session.
+      if (active !== a) return;
+      if (a.config.eventsContent === config.eventsContent && a.config.eventsControl === config.eventsControl) return;
+      try { wireEvents(ctx, a.name, config, a.session, a.children); }
+      catch (error) { ctx.ui.notify(`Could not rebuild the events integration: ${errorText(error)}`, 'error'); }
+    } });
   const pickModel = async (ctx: ExtensionContext, role: 'compactor' | 'subagent') => {
     const a = required();
     if (ctx.mode !== 'tui') throw new Error('Choosing a model requires interactive Pi. Edit config.json in the profile directory instead.');

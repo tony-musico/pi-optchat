@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
-import { createAgentSession, createEventBus, DefaultResourceLoader, type EventBus, ModelRuntime, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, createEventBus, DefaultResourceLoader, type EventBus, type ExtensionUIContext, ModelRuntime, SessionManager, SettingsManager, type Theme } from '@earendil-works/pi-coding-agent';
+import type { Component } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 import optchat from '../src/index.ts';
 import { CAPABILITIES_EVENT, STATUS_EVENT, type StatusCapabilitiesV1 } from '../src/agent-status.ts';
@@ -28,6 +29,7 @@ import {
   type OwnerEventV1,
 } from '../src/events-contract.ts';
 import { createProfile, loadConfig, profilePath, saveConfig } from '../src/profiles.ts';
+import { SETTING_KEYS } from '../src/settings.ts';
 import { result } from '../src/core/tools.ts';
 import { textContent } from '../src/transcript.ts';
 import { emptyUsage } from '../src/usage.ts';
@@ -42,7 +44,7 @@ after(() => {
   removeDir(root);
 });
 const fixture = { provider: 'fixture', model: 'fixture', thinking: 'off' as const };
-for (const name of ['work', 'delta', 'tool', 'errors', 'abort', 'content-off', 'late', 'ping', 'control', 'history', 'history-off']) {
+for (const name of ['work', 'delta', 'tool', 'errors', 'abort', 'content-off', 'late', 'ping', 'control', 'history', 'history-off', 'gated', 'toggle']) {
   createProfile(name);
   saveConfig(profilePath(name), { ...loadConfig(profilePath(name)), compactor: fixture, subagent: fixture });
 }
@@ -66,6 +68,8 @@ async function start(dir: string, options: {
   connect?: string;
   select?: (title: string, choices: string[]) => Promise<string | undefined>;
   failOwnerNotice?: boolean;
+  /** Replaces Pi's own custom UI, so a test can drive a page the extension opens. */
+  custom?: ExtensionUIContext['custom'];
 } = {}) {
   mkdirSync(dir, { recursive: true });
   let releaseDelta = () => {}, releaseDone = () => {}, deltaStarted = () => {}, abortStarted = () => {};
@@ -144,13 +148,16 @@ async function start(dir: string, options: {
     notes.push(text);
     if (options.failOwnerNotice && text.startsWith('OptChat') && text.includes(' · ')) throw new Error('SECRET-OWNER-NOTICE-FAILURE');
   },
-    select: async (title, choices) => options.select ? options.select(title, choices) : undefined }, mode: options.mode ?? 'tui', onError: error => { errors.push(error.error); } });
+    select: async (title, choices) => options.select ? options.select(title, choices) : undefined,
+    ...(options.custom ? { custom: options.custom } : {}) }, mode: options.mode ?? 'tui', onError: error => { errors.push(error.error); } });
   const events = (channel: string) => published.filter(event => event.channel === channel).map(event => event.data);
   const capability = () => events(CAPABILITIES_EVENT)[0] as StatusCapabilitiesV1 | undefined;
+  /** The newest capability advertisement, after the owner was replaced. */
+  const latestCapability = () => events(CAPABILITIES_EVENT).at(-1) as StatusCapabilitiesV1 | undefined;
   const ownerEpoch = () => capability()?.integrations?.ownerEpoch;
   const close = async () => { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); };
   return {
-    session, manager, bus, published, notes, errors, events, capability, ownerEpoch, close,
+    session, manager, bus, published, notes, errors, events, capability, latestCapability, ownerEpoch, close,
     releaseDelta, releaseDone, deltaSeen, abortSeen,
   };
 }
@@ -483,4 +490,59 @@ test('TUI, RPC, print, and JSON owners publish; plain and joined sessions do not
       assert.equal((owner.events(OWNER_EVENT) as OwnerEventV1[]).some(event => event.ownerSessionId === joinedSession), false);
     } finally { await joined.close(); }
   } finally { await owner.close(); }
+});
+
+test('a profile setting turns the content gate on without a CLI flag, and leaves control off', async () => {
+  saveConfig(profilePath('gated'), { ...loadConfig(profilePath('gated')), eventsContent: true });
+  const pi = await start(join(root, 'gated'), { bound: 'gated' });
+  try {
+    const capability = pi.capability();
+    assert.equal(capability?.integrations?.content.enabled, true, 'the saved setting turns the content gate on');
+    assert.equal(capability?.integrations?.control.enabled, false, 'the gates stay independent');
+    const ownerSessionId = pi.manager.getSessionId();
+    const epoch = pi.ownerEpoch();
+    assert.ok(epoch);
+    pi.bus.emit(HISTORY_REQUEST_EVENT, request(epoch, 'history:recent', { limit: 20, cursor: null }, { ownerSessionId, requestId: 'gated-history' }));
+    await until(() => (pi.events(HISTORY_RESULT_EVENT) as EventRequestResultV1[]).some(result => result.requestId === 'gated-history' && result.phase === 'completed'), 'history allowed by the saved setting');
+    pi.bus.emit(AGENT_REQUEST_EVENT, request(epoch, 'agent:spawn', {
+      tasks: [{ task: 'gated control', model: 'fixture/fixture', thinking: 'off' }],
+    }, { ownerSessionId, requestId: 'gated-control' }));
+    await until(() => pi.events(AGENT_RESULT_EVENT).length === 1, 'control refused');
+    assert.equal((pi.events(AGENT_RESULT_EVENT)[0] as EventRequestResultV1).outcome.code, 'DISABLED');
+  } finally { await pi.close(); }
+});
+
+test('the settings page turns a gate on in the running session, with a new owner to bind to', async () => {
+  const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+  let page: Component | undefined;
+  const pi = await start(join(root, 'toggle'), { bound: 'toggle',
+    custom: (async (factory: (tui: unknown, theme: Theme, keys: unknown, done: (result: undefined) => void) => Component) => {
+      page = factory({ requestRender: () => {} }, plain, {}, () => {});
+    }) as unknown as ExtensionUIContext['custom'] });
+  try {
+    const ownerSessionId = pi.manager.getSessionId();
+    const before = pi.ownerEpoch();
+    assert.ok(before);
+    assert.equal(pi.capability()?.integrations?.content.enabled, false);
+    pi.bus.emit(HISTORY_REQUEST_EVENT, request(before, 'history:recent', { limit: 20, cursor: null }, { ownerSessionId, requestId: 'before-toggle' }));
+    await until(() => pi.events(HISTORY_RESULT_EVENT).length === 1, 'history refused before the toggle');
+    assert.equal((pi.events(HISTORY_RESULT_EVENT)[0] as EventRequestResultV1).outcome.code, 'DISABLED');
+
+    await pi.session.prompt('/optchat settings');
+    assert.ok(page, 'the settings page opened');
+    // Two model rows sit above the setting rows, and Events content is the first events row.
+    for (let row = 0; row < 2 + SETTING_KEYS.indexOf('eventsContent'); row++) page!.handleInput?.('\x1b[B');
+    page!.handleInput?.(' ');
+    assert.equal(loadConfig(profilePath('toggle')).eventsContent, true, 'the setting is saved');
+
+    await until(() => pi.events(OWNER_EVENT).some(event => (event as OwnerEventV1).kind === 'closing'), 'the old owner closes');
+    assert.equal(pi.latestCapability()?.integrations?.content.enabled, true, 'the rebuilt owner advertises the gate');
+    const after = pi.latestCapability()?.integrations?.ownerEpoch;
+    assert.ok(after);
+    assert.notEqual(after, before, 'the rebuilt owner has its own epoch');
+
+    pi.bus.emit(HISTORY_REQUEST_EVENT, request(after, 'history:recent', { limit: 20, cursor: null }, { ownerSessionId, requestId: 'after-toggle' }));
+    await until(() => (pi.events(HISTORY_RESULT_EVENT) as EventRequestResultV1[]).some(result => result.requestId === 'after-toggle' && result.phase === 'completed'), 'history allowed after the toggle');
+    assert.equal(loadConfig(profilePath('toggle')).eventsControl, false, 'the other gate stays off');
+  } finally { await pi.close(); }
 });

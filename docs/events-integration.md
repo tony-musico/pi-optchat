@@ -10,7 +10,7 @@ There is **no shipped Discord transport**. A Discord bot would be an external br
 
 - `pi.events` is local to one Pi process. A separately running bot cannot subscribe to another process's bus.
 - Extensions in the same process are already trusted. Channel names, client IDs, request IDs, owner IDs, and epochs are routing data, not authentication or sandboxing.
-- The two integration flags are independent operator consent, not proof that an external identity is authorized.
+- The two integration gates, each turned on by its CLI flag or its profile setting, are independent operator consent, not proof that an external identity is authorized.
 - Do not assume that remote, joined, print, or JSON sessions provide this contract. A consumer must bind the actual owner identity it observes and discard state when that owner closes or changes.
 - The content flag does not redact user- or assistant-authored text. Text may naturally contain secrets or paths.
 - No remote conversation submission, exact queue-depth reporting, generic attention reply, approval simulation, durable delivery, Discord credentials, or Discord dependencies are included.
@@ -24,7 +24,13 @@ Both flags are registered as boolean Pi CLI flags and default to `false`:
 | `--optchat-events-content` | `false` | Assistant-output subscriptions and bounded history/result reads. |
 | `--optchat-events-control` | `false` | Spawn, steer, stop, and resume operations for authorized background agents. |
 
-There are no other event-integration flags and no settings-schema entry for these flags. Enabling one does not enable the other.
+There are no other event-integration flags. Enabling one does not enable the other.
+
+### The same gates in the settings page
+
+Each gate is also a profile setting: `/optchat settings` lists **Events content** and **Events control**, both off by default, and saves them in the profile's `config.json`. Either the saved setting or the CLI flag turns its gate on, and the two gates stay independent.
+
+A saved gate applies to the running session at once. OptChat rebuilds the events integration, so the owner is replaced by a new epoch: a consumer binds to the new owner epoch and resubscribes its output subscription, exactly as it does when a profile is reopened. The capability advertisement of the new owner states the gates it was built with.
 
 ## Exact channels
 
@@ -239,7 +245,7 @@ Conversation submit, queue, and steer requests are also rejected with `UNSUPPORT
 
 ## Opt-in assistant output
 
-Output requires `--optchat-events-content`. A subscription is identified by the caller-selected `subscriptionId` and scoped to its `clientId`.
+Output requires the content gate (`--optchat-events-content`, or the profile's Events content setting). A subscription is identified by the caller-selected `subscriptionId` and scoped to its `clientId`.
 
 - At most eight subscriptions exist at once. Each lease lasts five minutes; repeating `output:subscribe` with the same ID and client renews it.
 - Another client using the same subscription ID receives `REQUEST_CONFLICT`.
@@ -257,7 +263,7 @@ Pi's event bus does not provide network backpressure or await a slow consumer. A
 
 ## Authorized agent controls
 
-Agent operations require `--optchat-events-control` and use the generic request/result envelope.
+Agent operations require the control gate (`--optchat-events-control`, or the profile's Events control setting) and use the generic request/result envelope.
 
 - `agent:spawn` requires one to eight tasks, each with explicit task, authenticated model, and supported thinking level. It returns run IDs, not task bodies. It uses the current owner's working directory and normal Children model, depth, and maximum-agent policy.
 - `agent:steer` targets an exact live, top-level, non-connected running run and requires `runId` plus matching `expectedStartedAt`. It cannot become an implicit resume.
@@ -268,7 +274,7 @@ Agent operations require `--optchat-events-control` and use the generic request/
 
 ## Bounded current-session history
 
-History requires `--optchat-events-content` and uses the generic request/result envelope.
+History requires the content gate (`--optchat-events-content`, or the profile's Events content setting) and uses the generic request/result envelope.
 
 ### Recent branch pages
 
