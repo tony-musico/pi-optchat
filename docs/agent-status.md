@@ -40,7 +40,7 @@ A host that arrives late asks for the current status with a ping; the owner answ
     "observationOnly": true,
     "maxAgents": 64,
     "minIntervalMs": 250,
-    "fields": ["runId", "state", "handingOff", "model", "elapsed", "currentTool", "lastActivityAt", "parentId", "depth"],
+    "fields": ["runId", "state", "handingOff", "model", "elapsed", "currentTool", "lastActivityAt", "parentId", "depth", "startedAt"],
     "titles": false
   }
 }
@@ -69,7 +69,8 @@ When the owner coordinator is present, capabilities also contain an additive `in
       "currentTool": "bash",
       "lastActivityAt": 1760000000000,
       "parentId": null,
-      "depth": 1
+      "depth": 1,
+      "startedAt": 1759999980000
     }
   ]
 }
@@ -95,8 +96,11 @@ When the owner coordinator is present, capabilities also contain an additive `in
 | `agents[].lastActivityAt` | When it last did something, or null when that is unknown. |
 | `agents[].parentId` | Its parent, or null. The parent may be missing from the list when the cap cut it. |
 | `agents[].depth` | 1 for a child of the main agent. |
+| `agents[].startedAt` | When the run started, in epoch milliseconds, or null when it cannot be published safely. It is the run's generation token. |
 
 The counts are exclusive: `active + paused + handingOff = total`. The list keeps the order OptChat lists agents in, so a parent comes before its children.
+
+`startedAt` is the token that says which generation of a run a host is looking at. A host that sends it back as `expectedStartedAt` in an agent control request names exactly that generation; a request that carries an older value is refused with `STALE_RUN`. A resumed run keeps its id and starts a new generation, so its `startedAt` changes and the snapshot says so.
 
 ## What is never published
 

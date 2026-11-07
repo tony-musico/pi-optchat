@@ -5,7 +5,7 @@
  */
 import { isHandingOff, isRunning, type RunInfo, type RunState } from './runs.ts';
 import { elapsed } from './inspector.ts';
-import type { IntegrationsCapabilityV1 } from './events-contract.ts';
+import { generationToken, type IntegrationsCapabilityV1 } from './events-contract.ts';
 
 /** The channels this extension publishes on. They are literal strings: a host may hard-code them. */
 export const STATUS_EVENT = 'optchat:status:v1';
@@ -20,7 +20,7 @@ export const MAX_AGENTS = 64;
 export const MIN_INTERVAL_MS = 250;
 
 /** The fields one agent row may carry. A host may ignore any of them, and may ignore fields it does not know. */
-export const STATUS_FIELDS = ['runId', 'state', 'handingOff', 'model', 'elapsed', 'currentTool', 'lastActivityAt', 'parentId', 'depth'] as const;
+export const STATUS_FIELDS = ['runId', 'state', 'handingOff', 'model', 'elapsed', 'currentTool', 'lastActivityAt', 'parentId', 'depth', 'startedAt'] as const;
 
 /** Every string a snapshot may carry has a bound and a syntax. Anything else is left out rather than published. */
 const LIMITS = { profile: 128, session: 128, run: 128, model: 256, tool: 128, elapsed: 64 } as const;
@@ -56,6 +56,12 @@ export interface StatusAgentV1 {
   parentId: string | null;
   /** How deep the run is: 1 for a child of the main agent. */
   depth: number;
+  /**
+   * When the run started, in epoch milliseconds: the run's generation token.
+   * A host echoes it as `expectedStartedAt` to say which generation of a run it means.
+   * Null when the value cannot be published safely; a guess would be worse than nothing.
+   */
+  startedAt: number | null;
 }
 
 export interface StatusCountsV1 {
@@ -230,6 +236,7 @@ export function projectStatus(source: StatusSource, options: ProjectionOptions):
       lastActivityAt: live ? finite(live.updated) : ended,
       parentId: run.parentId ? safe(run.parentId, RUN, LIMITS.run) : null,
       depth: Number.isInteger(run.depth) ? run.depth : 1,
+      startedAt: generationToken(run.started),
     });
   }
   return {
@@ -289,13 +296,17 @@ export function statusCapabilities(profile: string, ownerSessionId: string, opti
   };
 }
 
-/** What a host can compare: sampledAt and elapsed drift are not a change. */
+/**
+ * What a host can compare: sampledAt and elapsed drift are not a change.
+ * The generation token is part of the key: a resumed run keeps its id but starts a new generation,
+ * and a host that never hears about it would keep sending a token the run no longer has.
+ */
 export function statusKey(status: StatusV1): string {
   return JSON.stringify({
     profile: status.profile,
     ownerSessionId: status.ownerSessionId,
     counts: status.counts,
-    agents: status.agents.map(agent => [agent.runId, agent.state, agent.handingOff, agent.model, agent.currentTool, agent.lastActivityAt, agent.parentId, agent.depth]),
+    agents: status.agents.map(agent => [agent.runId, agent.state, agent.handingOff, agent.model, agent.currentTool, agent.lastActivityAt, agent.parentId, agent.depth, agent.startedAt]),
   });
 }
 

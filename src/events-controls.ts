@@ -18,6 +18,8 @@ import {
   AGENT_REQUEST_EVENT,
   EVENT_LIMITS,
   HISTORY_REQUEST_EVENT,
+  generationToken,
+  type AgentSpawnResultV1,
   type EventErrorCode,
   type EventRequestV1,
   type HistoryPageV1,
@@ -163,6 +165,14 @@ function runView(children: ControlChildren, id: string): RunView | undefined {
   if (live) return { run: live, live: true };
   const run = children.history.records.get(id);
   return run ? { run, live: false } : undefined;
+}
+
+/**
+ * A run's generation token: the epoch milliseconds it started at, or null when that cannot be published safely.
+ * A client sends it back as `expectedStartedAt`, which is what says which generation of a run a request means.
+ */
+function runGenerationToken(children: ControlChildren, id: string): number | null {
+  return generationToken(runView(children, id)?.run.started);
 }
 
 function topLevel(run: RunInfo): boolean {
@@ -473,7 +483,9 @@ export function createEventControls(options: EventControlsOptions): EventControl
       }));
       try {
         const runIds = await options.children.spawn(tasks, options.cwd, context.signal, undefined, false);
-        const value: JsonValueV1 = { runIds };
+        // The generation token travels with the id: a client that cannot name the generation cannot address the run at all.
+        const runs = runIds.map(runId => ({ runId, startedAt: runGenerationToken(options.children, runId) }));
+        const value: JsonValueV1 = { runIds, runs } satisfies AgentSpawnResultV1;
         return { ok: true, value };
       } catch {
         return { ok: false, code: validate(request) ?? 'INTERNAL_ERROR' };

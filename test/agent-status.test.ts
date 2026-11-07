@@ -172,7 +172,7 @@ test('nothing but the allowlist reaches the payload', () => {
   const text = JSON.stringify(status);
   assert.doesNotMatch(text, /SECRET-TASK-TEXT/);
   assert.deepEqual(Object.keys(status), ['version', 'profile', 'ownerSessionId', 'sampledAt', 'counts', 'agents']);
-  assert.deepEqual(Object.keys(status.agents[0]), ['runId', 'state', 'handingOff', 'model', 'elapsed', 'currentTool', 'lastActivityAt', 'parentId', 'depth']);
+  assert.deepEqual(Object.keys(status.agents[0]), ['runId', 'state', 'handingOff', 'model', 'elapsed', 'currentTool', 'lastActivityAt', 'parentId', 'depth', 'startedAt']);
   assert.deepEqual(Object.keys(status.counts), ['active', 'paused', 'handingOff', 'total', 'omitted']);
 });
 
@@ -195,6 +195,31 @@ test('the same fleet at another time is the same key, and a new state is not', (
   assert.ok(one && two && three);
   assert.equal(statusKey(one), statusKey(two), 'time alone is not a change');
   assert.notEqual(statusKey(one), statusKey(three), 'a new state is a change');
+
+});
+
+test('the snapshot publishes the generation token, and a new generation is a change', () => {
+  const started = 1_700_000_000_000;
+  const runs = [run({ id: 'a', state: 'running', started })];
+  const status = projectStatus(source(runs), { profile: 'work', ownerSessionId: 'session-1', now: started + 1_000 });
+  assert.ok(status);
+  assert.equal(status.agents[0].startedAt, started, 'a host can name this generation of the run');
+  const before = statusKey(status);
+  // A resumed run keeps its id and starts a new generation, so the token changes.
+  runs[0].started = started + 60_000;
+  const resumed = projectStatus(source(runs), { profile: 'work', ownerSessionId: 'session-1', now: started + 61_000 });
+  assert.ok(resumed);
+  assert.equal(resumed.agents[0].startedAt, started + 60_000);
+  assert.notEqual(statusKey(resumed), before, 'a new generation is a change a host must hear about');
+});
+
+test('a start time that cannot be published is left out rather than guessed', () => {
+  const unsafe = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY];
+  for (const started of unsafe) {
+    const status = projectStatus(source([run({ id: 'a', state: 'running', started })]), { profile: 'work', ownerSessionId: 'session-1', now: 5_000 });
+    assert.ok(status);
+    assert.equal(status.agents[0].startedAt, null, `started ${started} is not a token`);
+  }
 });
 
 test('capabilities say what the owner offers, and nothing else', () => {
@@ -210,7 +235,7 @@ test('capabilities say what the owner offers, and nothing else', () => {
   assert.equal(capabilities.status.maxAgents, 64);
   assert.equal(capabilities.status.minIntervalMs, 250);
   assert.equal(capabilities.status.titles, false);
-  assert.deepEqual([...capabilities.status.fields], ['runId', 'state', 'handingOff', 'model', 'elapsed', 'currentTool', 'lastActivityAt', 'parentId', 'depth']);
+  assert.deepEqual([...capabilities.status.fields], ['runId', 'state', 'handingOff', 'model', 'elapsed', 'currentTool', 'lastActivityAt', 'parentId', 'depth', 'startedAt']);
   assert.equal(statusCapabilities('Work', 'session-1'), undefined);
 });
 

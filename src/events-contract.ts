@@ -278,6 +278,28 @@ export interface AgentTargetPayloadV1 {
   readonly expectedStartedAt: number;
 }
 
+/** One spawned run: the id a later request names, and the token that says which generation it means. */
+export interface AgentSpawnRunV1 {
+  readonly runId: string;
+  /** When the run started, in epoch milliseconds, or null when it cannot be published safely. */
+  readonly startedAt: number | null;
+}
+
+/** What `agent:spawn` returns: the run ids, and each run's generation token. */
+export interface AgentSpawnResultV1 {
+  readonly runIds: readonly string[];
+  readonly runs: readonly AgentSpawnRunV1[];
+}
+
+/**
+ * A run's generation token: the epoch milliseconds it started at, or null when it cannot be published safely.
+ * A host sends it back as `expectedStartedAt`, which is what says which generation of a run a request means.
+ * The token must be a whole positive millisecond, because that is all the request parser accepts.
+ */
+export function generationToken(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 export interface AgentMessageTargetPayloadV1 extends AgentTargetPayloadV1 {
   readonly message: string;
 }

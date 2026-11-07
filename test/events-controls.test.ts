@@ -187,11 +187,11 @@ test('disabled control rejects before any child, model, or filesystem work', asy
   h.controls.dispose();
 });
 
-test('spawn returns only run ids, uses the owner cwd, and executes exactly once on replay', async () => {
+test('spawn returns the run ids and each run\'s generation token, and executes exactly once on replay', async () => {
   const h = harness();
   h.events.api.emit('optchat:agent:request:v1', request('agent:spawn', spawnPayload));
   await until(() => h.terminal() !== undefined, 'spawn terminal');
-  assert.deepEqual(h.terminal()?.outcome.value, { runIds: ['run-new'] });
+  assert.deepEqual(h.terminal()?.outcome.value, { runIds: ['run-new'], runs: [{ runId: 'run-new', startedAt: null }] });
   assert.equal(h.children.spawnCalls.length, 1);
   assert.equal(h.children.spawnCalls[0].cwd, '/owner');
   assert.equal(h.children.spawnCalls[0].parentId, undefined);
@@ -205,6 +205,27 @@ test('spawn returns only run ids, uses the owner cwd, and executes exactly once 
   h.events.api.emit('optchat:agent:request:v1', request('agent:spawn', { tasks: [{ task: 'Different', model: 'fixture/fixture', thinking: 'off' }] }));
   await until(() => h.results().some(result => result.outcome.code === 'REQUEST_CONFLICT'), 'conflict');
   assert.equal(h.children.spawnCalls.length, 1);
+  h.controls.dispose();
+});
+
+test('a request that echoes a published generation token is accepted, and one that does not is stale', async () => {
+  const h = harness();
+  const started = 1_700_000_000_000;
+  const spawned = run({ id: 'run-new', started, state: 'running' });
+  h.children.liveRuns.set(spawned.id, { info: spawned });
+  h.children.ids.push(spawned.id);
+  h.events.api.emit('optchat:agent:request:v1', request('agent:spawn', spawnPayload));
+  await until(() => h.terminal() !== undefined, 'spawn terminal');
+  assert.deepEqual(h.terminal()?.outcome.value, { runIds: ['run-new'], runs: [{ runId: 'run-new', startedAt: started }] });
+
+  h.events.api.emit('optchat:agent:request:v1', request('agent:stop', { runId: spawned.id, expectedStartedAt: started }, { requestId: 'stop-token' }));
+  await until(() => h.results().some(result => result.requestId === 'stop-token' && result.phase === 'completed'), 'stop terminal');
+  assert.deepEqual(h.results().find(result => result.requestId === 'stop-token' && result.phase === 'completed')?.outcome.value, { runId: spawned.id, accepted: 'stop-requested' });
+
+  h.events.api.emit('optchat:agent:request:v1', request('agent:stop', { runId: spawned.id, expectedStartedAt: started - 1 }, { requestId: 'stop-stale' }));
+  await until(() => h.results().some(result => result.requestId === 'stop-stale' && result.phase === 'rejected'), 'stale rejection');
+  assert.equal(h.results().find(result => result.requestId === 'stop-stale')?.outcome.code, 'STALE_RUN');
+  assert.deepEqual(h.children.stopCalls, [spawned.id], 'only the request that carried the token stopped the run');
   h.controls.dispose();
 });
 

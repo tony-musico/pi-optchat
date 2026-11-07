@@ -8,7 +8,7 @@ import { createAgentSession, createEventBus, DefaultResourceLoader, type EventBu
 import type { Component } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 import optchat from '../src/index.ts';
-import { CAPABILITIES_EVENT, STATUS_EVENT, type StatusCapabilitiesV1 } from '../src/agent-status.ts';
+import { CAPABILITIES_EVENT, STATUS_EVENT, type StatusCapabilitiesV1, type StatusV1 } from '../src/agent-status.ts';
 import {
   AGENT_REQUEST_EVENT,
   AGENT_RESULT_EVENT,
@@ -386,11 +386,54 @@ test('control is default-off and an enabled owner performs one real Children spa
     await until(() => (on.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).some(result => result.phase === 'completed'), 'control terminal');
     const result = (on.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).find(candidate => candidate.phase === 'completed')!;
     assert.equal(result.outcome.status, 'ok');
-    const value = result.outcome.value as { runIds: string[] };
+    const value = result.outcome.value as { runIds: string[]; runs: { runId: string; startedAt: number | null }[] };
     assert.equal(value.runIds.length, 1);
     assert.match(value.runIds[0], /^[A-Za-z0-9-]+$/);
+    assert.equal(value.runs.length, 1);
+    assert.equal(value.runs[0].runId, value.runIds[0]);
+    assert.equal(typeof value.runs[0].startedAt, 'number', 'the spawn result carries the run generation token');
     assert.doesNotMatch(JSON.stringify(result), /control hold/);
   } finally { await on.close(); }
+});
+
+test('a host reads the generation token from the fleet snapshot and stops the run it names', async () => {
+  const pi = await start(join(root, 'control-token'), { bound: 'control', control: true });
+  try {
+    const epoch = pi.ownerEpoch();
+    assert.ok(epoch);
+    const ownerSessionId = pi.manager.getSessionId();
+    pi.bus.emit(AGENT_REQUEST_EVENT, request(epoch, 'agent:spawn', {
+      tasks: [{ task: 'Abort hold', model: 'fixture/fixture', thinking: 'off' }],
+    }, { ownerSessionId, requestId: 'token-spawn' }));
+    await until(() => (pi.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).some(result => result.requestId === 'token-spawn' && result.phase === 'completed'), 'spawn terminal');
+    const spawned = (pi.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).find(result => result.requestId === 'token-spawn' && result.phase === 'completed')!;
+    const value = spawned.outcome.value as { runIds: string[]; runs: { runId: string; startedAt: number | null }[] };
+    const runId = value.runIds[0];
+    assert.equal(typeof value.runs[0].startedAt, 'number', 'the spawn result carries the token too');
+
+    // The same token is on the fleet snapshot, so a host that only reads status can address the run.
+    await until(() => (pi.events(STATUS_EVENT) as StatusV1[]).some(status => status.agents.some(agent => agent.runId === runId && typeof agent.startedAt === 'number')), 'snapshot token');
+    const snapshot = (pi.events(STATUS_EVENT) as StatusV1[]).find(status => status.agents.some(agent => agent.runId === runId))!;
+    const agent = snapshot.agents.find(candidate => candidate.runId === runId)!;
+    assert.equal(agent.startedAt, value.runs[0].startedAt, 'the snapshot and the spawn result agree on the token');
+
+    pi.bus.emit(AGENT_REQUEST_EVENT, request(epoch, 'agent:stop', { runId, expectedStartedAt: agent.startedAt }, {
+      ownerSessionId, requestId: 'token-stop',
+    }));
+    await until(() => (pi.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).some(result => result.requestId === 'token-stop' && result.phase === 'completed'), 'stop terminal');
+    const stopped = (pi.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).find(result => result.requestId === 'token-stop' && result.phase === 'completed')!;
+    assert.equal(stopped.outcome.status, 'ok');
+    assert.deepEqual(stopped.outcome.value, { runId, accepted: 'stop-requested' });
+
+    pi.bus.emit(AGENT_REQUEST_EVENT, request(epoch, 'agent:stop', { runId, expectedStartedAt: (agent.startedAt ?? 0) - 1 }, {
+      ownerSessionId, requestId: 'token-stale',
+    }));
+    await until(() => (pi.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).some(result => result.requestId === 'token-stale' && result.phase === 'rejected'), 'stale rejection');
+    const stale = (pi.events(AGENT_RESULT_EVENT) as EventRequestResultV1[]).find(result => result.requestId === 'token-stale' && result.phase === 'rejected')!;
+    assert.equal(stale.outcome.code, 'STALE_RUN');
+  } finally {
+    pi.releaseDelta(); pi.releaseDone(); await pi.close();
+  }
 });
 
 test('real history reads expose only bounded branch text and a finalized child assistant result', async () => {

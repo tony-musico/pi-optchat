@@ -195,12 +195,13 @@ Details (reload behaviour, handoff limits, attach rules, headless joins): [docs/
 
 ## Live agent status for extensions
 
-The Pi process that owns a profile publishes what its background agents are doing on Pi's in-process event bus: state, model, elapsed time, current tool, last activity, and how many agents are running, paused or still owing a handoff. Another extension in the same process can show that without importing OptChat or reading its files.
+The Pi process that owns a profile publishes what its background agents are doing on Pi's in-process event bus: state, model, elapsed time, current tool, last activity, when each run started, and how many agents are running, paused or still owing a handoff. Another extension in the same process can show that without importing OptChat or reading its files.
 
 - **In-process only**: another terminal, a `pi -p` run and a connected window see nothing. Only the process that opened the profile publishes.
 - **Observation only**: nothing in this background-agent snapshot contract can start, steer or stop an agent. Separate event integrations have their own consent flags.
 - **Private by default**: no task text, no titles, no paths, no transcripts, no tool arguments or output.
 - **Bounded**: 64 agents per snapshot, at most one snapshot every 250 ms, and the counts stay exact past the cap.
+- **Addressable**: the snapshot's `startedAt` is each run's generation token, the value a host sends back as `expectedStartedAt` to steer, stop or resume that exact run.
 
 Contract, channels and a host example: [docs/agent-status.md](docs/agent-status.md).
 

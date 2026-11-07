@@ -169,6 +169,17 @@ Output subscribe/unsubscribe/resync acknowledgements are deliberately **not** ge
 
 For `agent:spawn`, validation requires an explicit authenticated model and supported thinking level even though the parser permits nullable fields. Task text and steer/resume messages are bounded to 32 KiB. A spawn contains at most eight tasks.
 
+### Naming a run: the generation token
+
+`agent:steer`, `agent:stop`, `agent:resume`, and `history:result` all take a `runId` plus an `expectedStartedAt`: the epoch milliseconds the run started at. It is the run's generation token, and it is published in two places:
+
+- The fleet snapshot on `optchat:status:v1` carries `agents[].startedAt` (null when it cannot be published safely). The same value is advertised in the capability's `status.fields` list.
+- The `agent:spawn` result carries `{ "runIds": [...], "runs": [{ "runId": "...", "startedAt": 1760000000000 }] }`. `runIds` is unchanged; `runs` is additive.
+
+A host reads the token, keeps it with the run id, and sends it back as `expectedStartedAt`. A request that carries a different value is refused with `STALE_RUN`: a resumed run keeps its id and starts a new generation, and a reused id must never be addressable by an old token. The token is a whole positive millisecond, exactly what the request parser accepts.
+
+The fleet snapshot lists the runs that are active, paused, or still owing a handoff, so a host that watches a run sees its token while it works and can keep it for a later `history:result` or `agent:resume` on the same generation. A host that never saw a run while it was running has no published token for it; the spawn result covers the runs it started itself.
+
 ### Idempotency, deadlines, and capacity
 
 - The idempotency key is `ownerEpoch + clientId + requestId`.
@@ -265,7 +276,7 @@ Pi's event bus does not provide network backpressure or await a slow consumer. A
 
 Agent operations require the control gate (`--optchat-events-control`, or the profile's Events control setting) and use the generic request/result envelope.
 
-- `agent:spawn` requires one to eight tasks, each with explicit task, authenticated model, and supported thinking level. It returns run IDs, not task bodies. It uses the current owner's working directory and normal Children model, depth, and maximum-agent policy.
+- `agent:spawn` requires one to eight tasks, each with explicit task, authenticated model, and supported thinking level. It returns run IDs and each run's generation token, not task bodies. It uses the current owner's working directory and normal Children model, depth, and maximum-agent policy.
 - `agent:steer` targets an exact live, top-level, non-connected running run and requires `runId` plus matching `expectedStartedAt`. It cannot become an implicit resume.
 - `agent:resume` targets an exact finished, top-level, non-connected run and uses the existing manager-resume path.
 - `agent:stop` targets an exact live, top-level, non-connected active run. Its successful value is `accepted: "stop-requested"`; it does not claim that the run has exited.
@@ -377,6 +388,7 @@ This illustrative in-process pattern binds the owner from capabilities, subscrib
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 
 const CAPABILITIES = 'optchat:capabilities:v1';
+const STATUS = 'optchat:status:v1';
 const STATUS_PING = 'optchat:status:ping:v1';
 const MAIN_PING = 'optchat:main:ping:v1';
 const OWNER = 'optchat:owner:event:v1';
@@ -390,16 +402,21 @@ const CLIENT_ID = 'discord-bridge-example';
 const SUBSCRIPTION_ID = 'discord-output';
 
 type Owner = { ownerSessionId: string; ownerEpoch: string };
-type AgentCommand = { requestId: string; runId: string; expectedStartedAt: number };
+type AgentCommand = { requestId: string; runId: string };
 
 export default function eventsBridge(pi: ExtensionAPI) {
   let owner: Owner | undefined;
   const pendingAgentRequests = new Set<string>();
+  // The generation token of every run the bridge has seen, taken from the fleet snapshot.
+  const startedAtByRun = new Map<string, number>();
 
   // The bridge's own ACL would make this decision. The sample authorizes nothing.
   const authorizeExternalCommand = (_command: unknown): boolean => false;
   const sendAuthorizedAgentRequest = (command: AgentCommand) => {
     if (!owner || !authorizeExternalCommand(command)) return;
+    // A run whose token is unknown is not addressable: the request would be refused as stale anyway.
+    const expectedStartedAt = startedAtByRun.get(command.runId);
+    if (expectedStartedAt === undefined) return;
     pendingAgentRequests.add(command.requestId);
     pi.events.emit(AGENT_REQUEST, {
       version: 1,
@@ -408,7 +425,7 @@ export default function eventsBridge(pi: ExtensionAPI) {
       ownerSessionId: owner.ownerSessionId,
       ownerEpoch: owner.ownerEpoch,
       operation: 'agent:stop',
-      payload: { runId: command.runId, expectedStartedAt: command.expectedStartedAt },
+      payload: { runId: command.runId, expectedStartedAt },
     });
   };
 
@@ -426,6 +443,12 @@ export default function eventsBridge(pi: ExtensionAPI) {
   };
 
   const off = [
+    pi.events.on(STATUS, data => {
+      const status = data as { version: number; agents: { runId: string; startedAt: number | null }[] };
+      if (status.version !== 1) return;
+      // The snapshot carries the generation token of every run it lists.
+      for (const agent of status.agents) if (agent.startedAt !== null) startedAtByRun.set(agent.runId, agent.startedAt);
+    }),
     pi.events.on(CAPABILITIES, data => {
       const capability = data as {
         version: number;
@@ -472,6 +495,7 @@ export default function eventsBridge(pi: ExtensionAPI) {
     outputRequest('output:unsubscribe');
     owner = undefined;
     pendingAgentRequests.clear();
+    startedAtByRun.clear();
     for (const stop of off) stop();
   });
 
